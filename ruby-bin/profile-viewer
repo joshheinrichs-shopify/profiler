@@ -50,8 +50,47 @@ class Profile < WEBrick::HTTPServlet::AbstractServlet
   end
 end
 
+def merge_profiles!(profiles)
+  min_start_time = profiles.map { |profile| profile['meta']['startTime'] }.min
+
+  profiles.each do |profile|
+    original_start_time = profile['meta']['startTime']
+    offset = original_start_time - min_start_time
+    profile['meta']['startTime'] = min_start_time
+    profile['threads'].each do |thread|
+      thread['registerTime'] += offset if thread['registerTime']
+      thread['processStartupTime'] += offset if thread['processStartupTime']
+      thread['unregisterTime'] += offset if thread['unregisterTime']
+      thread['processShutdownTime'] += offset if thread['processShutdownTime']
+      thread['samples']['time'].map! { |time| time + offset }
+      thread['markers']['startTime'].map! { |time| time ? time + offset : nil }
+      thread['markers']['endTime'].map! { |time| time ? time + offset : nil }
+    end
+  end
+
+  merged_profile = {
+    'meta' => profiles[0]['meta'],
+    'libs' => profiles.map { |profile| profile['libs'] }.flatten,
+    'threads' => profiles.map { |profile| profile['threads'] }.flatten,
+  }
+  initial_visible_threads = []
+  merged_profile['threads'].each_with_index do |thread, index|
+    initial_visible_threads << index if thread['isMainThread']
+  end
+  merged_profile['meta']['initialVisibleThreads'] = initial_visible_threads
+
+  merged_profile
+end
+
+options = {
+  merge: false,
+}
 o = OptionParser.new do |opts|
   opts.banner = "Usage: profile-viewer profile.json"
+
+  opts.on("--merge", "Merge profiles") do
+    options[:merge] = true
+  end
 
   opts.on("-v", "Show version") do |v|
     require_relative "profile-viewer-version"
@@ -67,13 +106,6 @@ end
 o.parse!
 
 unless ARGV[0]
-  $stderr.puts o
-  exit(2)
-end
-
-unless File.exist?(ARGV[0])
-  $stderr.puts "no such file #{ARGV[0]}"
-  $stderr.puts
   $stderr.puts o
   exit(2)
 end
@@ -94,21 +126,35 @@ trap 'INT' do server.shutdown end
 
 server.mount "/from-url", GetIndex
 
-valid_files = Set.new
+profiles = ARGV.map do |profile_path|
+  unless File.exist?(profile_path)
+    $stderr.puts "no such file #{profile_path}"
+    $stderr.puts
+    $stderr.puts o
+    exit(2)
+  end
 
-ARGV.each.with_index do |profile, index|
-  full_path = File.expand_path profile
-
-  is_gzipped = File.binread(full_path, 2) == "\x1F\x8B".b
+  is_gzipped = File.binread(profile_path, 2) == "\x1F\x8B".b
   content = if is_gzipped
     require "zlib"
-    Zlib::GzipReader.open(full_path) { |gz| gz.read }
+    Zlib::GzipReader.open(profile_path) { |gz| gz.read }
   else
-    File.read full_path
+    File.read(profile_path)
   end
-  parsed_file = JSON.parse content
+  parsed_profile = JSON.parse(content)
 
-  parsed_file["threads"].each do |thread|
+  [profile_path, parsed_profile]
+end
+
+if options[:merge]
+  parsed_profiles = profiles.map { |_, parsed_profile| parsed_profile }
+  profiles = [["merge", merge_profiles!(parsed_profiles)]]
+end
+
+valid_files = Set.new
+
+profiles.each.with_index do |(profile_path, parsed_profile), index|
+  parsed_profile["threads"].each do |thread|
     thread["stringArray"].map! do |str|
       if str.start_with?("/") && File.exist?(str)
         valid_files << str
@@ -120,8 +166,8 @@ ARGV.each.with_index do |profile, index|
   end
 
   uri_path = "/profile#{index unless ARGV.size == 1}"
-  $stderr.puts "Mounting #{full_path} at #{uri_path}"
-  server.mount uri_path, Profile, full_path, parsed_file
+  $stderr.puts "Mounting #{profile_path} at #{uri_path}"
+  server.mount uri_path, Profile, profile_path, parsed_profile
   profile_paths << uri_path
 end
 
